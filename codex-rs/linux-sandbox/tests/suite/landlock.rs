@@ -1,5 +1,4 @@
 #![cfg(target_os = "linux")]
-#![allow(clippy::unwrap_used)]
 use codex_core::config::types::ShellEnvironmentPolicy;
 use codex_core::error::CodexErr;
 use codex_core::error::Result;
@@ -48,6 +47,56 @@ fn create_env_from_core_vars() -> HashMap<String, String> {
     create_env(&policy, None)
 }
 
+/// Single-quote a string for safe use as a shell word.  Handles embedded
+/// single-quotes with the `'...''"'"'...'` idiom so paths containing spaces
+/// or special characters are passed literally to the shell.
+fn shell_quote(s: &str) -> String {
+    // Each embedded single-quote is closed, escaped, then reopened: ' → '\''.
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Core execution helper shared by all test helpers.  Builds `ExecParams` once
+/// and calls `process_exec_tool_call` so the sandboxing plumbing is exercised
+/// identically in every test path.
+#[expect(clippy::expect_used)]
+async fn exec_sandboxed(
+    cmd: &[&str],
+    sandbox_policy: SandboxPolicy,
+    file_system_sandbox_policy: FileSystemSandboxPolicy,
+    network_sandbox_policy: NetworkSandboxPolicy,
+    timeout_ms: u64,
+    use_legacy_landlock: bool,
+) -> Result<codex_core::exec::ExecToolCallOutput> {
+    let cwd = std::env::current_dir().expect("current dir should be accessible");
+    let params = ExecParams {
+        command: cmd.iter().copied().map(str::to_owned).collect(),
+        cwd: cwd.clone(),
+        expiration: timeout_ms.into(),
+        capture_policy: ExecCapturePolicy::ShellTool,
+        env: create_env_from_core_vars(),
+        network: None,
+        sandbox_permissions: SandboxPermissions::UseDefault,
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
+        windows_sandbox_private_desktop: false,
+        justification: None,
+        arg0: None,
+    };
+    let sandbox_program = env!("CARGO_BIN_EXE_codex-linux-sandbox");
+    let codex_linux_sandbox_exe = Some(PathBuf::from(sandbox_program));
+
+    process_exec_tool_call(
+        params,
+        &sandbox_policy,
+        &file_system_sandbox_policy,
+        network_sandbox_policy,
+        cwd.as_path(),
+        &codex_linux_sandbox_exe,
+        use_legacy_landlock,
+        None,
+    )
+    .await
+}
+
 #[expect(clippy::print_stdout)]
 async fn run_cmd(cmd: &[&str], writable_roots: &[PathBuf], timeout_ms: u64) {
     let output = run_cmd_output(cmd, writable_roots, timeout_ms).await;
@@ -69,6 +118,7 @@ async fn run_cmd_output(
         .expect("sandboxed command should execute")
 }
 
+#[expect(clippy::expect_used)]
 async fn run_cmd_result_with_writable_roots(
     cmd: &[&str],
     writable_roots: &[PathBuf],
@@ -79,7 +129,10 @@ async fn run_cmd_result_with_writable_roots(
     let sandbox_policy = SandboxPolicy::WorkspaceWrite {
         writable_roots: writable_roots
             .iter()
-            .map(|p| AbsolutePathBuf::try_from(p.as_path()).unwrap())
+            .map(|p| {
+                AbsolutePathBuf::try_from(p.as_path())
+                    .expect("writable root should be an absolute path")
+            })
             .collect(),
         read_only_access: Default::default(),
         network_access,
@@ -102,7 +155,6 @@ async fn run_cmd_result_with_writable_roots(
     .await
 }
 
-#[expect(clippy::expect_used)]
 async fn run_cmd_result_with_policies(
     cmd: &[&str],
     sandbox_policy: SandboxPolicy,
@@ -111,33 +163,13 @@ async fn run_cmd_result_with_policies(
     timeout_ms: u64,
     use_legacy_landlock: bool,
 ) -> Result<codex_core::exec::ExecToolCallOutput> {
-    let cwd = std::env::current_dir().expect("cwd should exist");
-    let sandbox_cwd = cwd.clone();
-    let params = ExecParams {
-        command: cmd.iter().copied().map(str::to_owned).collect(),
-        cwd,
-        expiration: timeout_ms.into(),
-        capture_policy: ExecCapturePolicy::ShellTool,
-        env: create_env_from_core_vars(),
-        network: None,
-        sandbox_permissions: SandboxPermissions::UseDefault,
-        windows_sandbox_level: WindowsSandboxLevel::Disabled,
-        windows_sandbox_private_desktop: false,
-        justification: None,
-        arg0: None,
-    };
-    let sandbox_program = env!("CARGO_BIN_EXE_codex-linux-sandbox");
-    let codex_linux_sandbox_exe = Some(PathBuf::from(sandbox_program));
-
-    process_exec_tool_call(
-        params,
-        &sandbox_policy,
-        &file_system_sandbox_policy,
+    exec_sandboxed(
+        cmd,
+        sandbox_policy,
+        file_system_sandbox_policy,
         network_sandbox_policy,
-        sandbox_cwd.as_path(),
-        &codex_linux_sandbox_exe,
+        timeout_ms,
         use_legacy_landlock,
-        None,
     )
     .await
 }
@@ -174,19 +206,37 @@ async fn should_skip_bwrap_tests() -> bool {
     }
 }
 
+/// Returns `true` and emits a skip message when the bubblewrap sandbox is
+/// unavailable in the current environment.  Tests that require bwrap should
+/// call this at the top and `return` immediately if it yields `true`.
+async fn skip_if_bwrap_unavailable() -> bool {
+    if should_skip_bwrap_tests().await {
+        eprintln!("skipping bwrap test: bwrap sandbox prerequisites are unavailable");
+        true
+    } else {
+        false
+    }
+}
+
 fn expect_denied(
     result: Result<codex_core::exec::ExecToolCallOutput>,
     context: &str,
 ) -> codex_core::exec::ExecToolCallOutput {
     match result {
         Ok(output) => {
-            assert_ne!(output.exit_code, 0, "{context}: expected nonzero exit code");
+            assert_ne!(
+                output.exit_code, 0,
+                "{context}: expected nonzero exit code\nstdout:\n{}\nstderr:\n{}",
+                output.stdout.text, output.stderr.text
+            );
             output
         }
         Err(CodexErr::Sandbox(SandboxErr::Denied { output, .. })) => *output,
-        Err(err) => panic!("{context}: {err:?}"),
+        Err(err) => panic!("{context}: unexpected error: {err:?}"),
     }
 }
+
+// ─── Basic sandbox tests ──────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn test_root_read() {
@@ -196,20 +246,25 @@ async fn test_root_read() {
 #[tokio::test]
 #[should_panic]
 async fn test_root_write() {
-    let tmpfile = NamedTempFile::new().unwrap();
+    let tmpfile = NamedTempFile::new().expect("temp file should be created");
     let tmpfile_path = tmpfile.path().to_string_lossy();
     run_cmd(
-        &["bash", "-lc", &format!("echo blah > {tmpfile_path}")],
+        &[
+            "bash",
+            "-lc",
+            &format!("echo blah > {}", shell_quote(&tmpfile_path)),
+        ],
         &[],
         SHORT_TIMEOUT_MS,
     )
     .await;
 }
 
+// ─── Bubblewrap filesystem tests ─────────────────────────────────────────────
+
 #[tokio::test]
 async fn test_dev_null_write() {
-    if should_skip_bwrap_tests().await {
-        eprintln!("skipping bwrap test: bwrap sandbox prerequisites are unavailable");
+    if skip_if_bwrap_unavailable().await {
         return;
     }
 
@@ -230,8 +285,7 @@ async fn test_dev_null_write() {
 
 #[tokio::test]
 async fn bwrap_populates_minimal_dev_nodes() {
-    if should_skip_bwrap_tests().await {
-        eprintln!("skipping bwrap test: bwrap sandbox prerequisites are unavailable");
+    if skip_if_bwrap_unavailable().await {
         return;
     }
 
@@ -254,8 +308,7 @@ async fn bwrap_populates_minimal_dev_nodes() {
 
 #[tokio::test]
 async fn bwrap_preserves_writable_dev_shm_bind_mount() {
-    if should_skip_bwrap_tests().await {
-        eprintln!("skipping bwrap test: bwrap sandbox prerequisites are unavailable");
+    if skip_if_bwrap_unavailable().await {
         return;
     }
     if !std::path::Path::new("/dev/shm").exists() {
@@ -277,7 +330,10 @@ async fn bwrap_preserves_writable_dev_shm_bind_mount() {
         &[
             "bash",
             "-lc",
-            &format!("printf sandbox-after > {}", target_path.to_string_lossy()),
+            &format!(
+                "printf sandbox-after > {}",
+                shell_quote(&target_path.to_string_lossy())
+            ),
         ],
         &[PathBuf::from("/dev/shm")],
         LONG_TIMEOUT_MS,
@@ -296,13 +352,13 @@ async fn bwrap_preserves_writable_dev_shm_bind_mount() {
 
 #[tokio::test]
 async fn test_writable_root() {
-    let tmpdir = tempfile::tempdir().unwrap();
+    let tmpdir = tempfile::tempdir().expect("temp dir should be created");
     let file_path = tmpdir.path().join("test");
     run_cmd(
         &[
             "bash",
             "-lc",
-            &format!("echo blah > {}", file_path.to_string_lossy()),
+            &format!("echo blah > {}", shell_quote(&file_path.to_string_lossy())),
         ],
         &[tmpdir.path().to_path_buf()],
         // We have seen timeouts when running this test in CI on GitHub,
@@ -314,8 +370,7 @@ async fn test_writable_root() {
 
 #[tokio::test]
 async fn sandbox_ignores_missing_writable_roots_under_bwrap() {
-    if should_skip_bwrap_tests().await {
-        eprintln!("skipping bwrap test: bwrap sandbox prerequisites are unavailable");
+    if skip_if_bwrap_unavailable().await {
         return;
     }
 
@@ -363,42 +418,22 @@ async fn test_timeout() {
     run_cmd(&["sleep", "2"], &[], 50).await;
 }
 
-/// Helper that runs `cmd` under the Linux sandbox and asserts that the command
-/// does NOT succeed (i.e. returns a non‑zero exit code) **unless** the binary
-/// is missing in which case we silently treat it as an accepted skip so the
-/// suite remains green on leaner CI images.
-#[expect(clippy::expect_used)]
-async fn assert_network_blocked(cmd: &[&str]) {
-    let cwd = std::env::current_dir().expect("cwd should exist");
-    let sandbox_cwd = cwd.clone();
-    let params = ExecParams {
-        command: cmd.iter().copied().map(str::to_owned).collect(),
-        cwd,
-        // Give the tool a generous 2-second timeout so even slow DNS timeouts
-        // do not stall the suite.
-        expiration: NETWORK_TIMEOUT_MS.into(),
-        capture_policy: ExecCapturePolicy::ShellTool,
-        env: create_env_from_core_vars(),
-        network: None,
-        sandbox_permissions: SandboxPermissions::UseDefault,
-        windows_sandbox_level: WindowsSandboxLevel::Disabled,
-        windows_sandbox_private_desktop: false,
-        justification: None,
-        arg0: None,
-    };
+// ─── Network sandbox tests ────────────────────────────────────────────────────
 
+/// Runs `cmd` under a read-only network-disabled sandbox and asserts that it
+/// does NOT succeed.  A missing binary (exit 127) is treated as a skip so the
+/// suite remains green on leaner CI images.
+async fn assert_network_blocked(cmd: &[&str]) {
     let sandbox_policy = SandboxPolicy::new_read_only_policy();
-    let sandbox_program = env!("CARGO_BIN_EXE_codex-linux-sandbox");
-    let codex_linux_sandbox_exe: Option<PathBuf> = Some(PathBuf::from(sandbox_program));
-    let result = process_exec_tool_call(
-        params,
-        &sandbox_policy,
-        &FileSystemSandboxPolicy::from(&sandbox_policy),
-        NetworkSandboxPolicy::from(&sandbox_policy),
-        sandbox_cwd.as_path(),
-        &codex_linux_sandbox_exe,
+    let fs_policy = FileSystemSandboxPolicy::from(&sandbox_policy);
+    let net_policy = NetworkSandboxPolicy::from(&sandbox_policy);
+    let result = exec_sandboxed(
+        cmd,
+        sandbox_policy,
+        fs_policy,
+        net_policy,
+        NETWORK_TIMEOUT_MS,
         false,
-        None,
     )
     .await;
 
@@ -410,14 +445,17 @@ async fn assert_network_blocked(cmd: &[&str]) {
         }
     };
 
-    dbg!(&output.stderr.text);
-    dbg!(&output.stdout.text);
-    dbg!(&output.exit_code);
+    // A missing binary exits with 127 – treat as a skip rather than a pass so
+    // the suite stays green on leaner CI images without silently hiding a breach.
+    if output.exit_code == 127 {
+        eprintln!(
+            "skipping network test: binary {:?} not found in sandbox (exit 127)",
+            cmd.first().copied().unwrap_or("<unknown>")
+        );
+        return;
+    }
 
-    // A completely missing binary exits with 127.  Anything else should also
-    // be non‑zero (EPERM from seccomp will usually bubble up as 1, 2, 13…)
     // If—*and only if*—the command exits 0 we consider the sandbox breached.
-
     if output.exit_code == 0 {
         panic!(
             "Network sandbox FAILED - {cmd:?} exited 0\nstdout:\n{}\nstderr:\n{}",
@@ -448,10 +486,11 @@ async fn sandbox_blocks_nc() {
     assert_network_blocked(&["nc", "-z", "127.0.0.1", "80"]).await;
 }
 
+// ─── Bubblewrap filesystem isolation tests ───────────────────────────────────
+
 #[tokio::test]
 async fn sandbox_blocks_git_and_codex_writes_inside_writable_root() {
-    if should_skip_bwrap_tests().await {
-        eprintln!("skipping bwrap test: bwrap sandbox prerequisites are unavailable");
+    if skip_if_bwrap_unavailable().await {
         return;
     }
 
@@ -469,7 +508,10 @@ async fn sandbox_blocks_git_and_codex_writes_inside_writable_root() {
             &[
                 "bash",
                 "-lc",
-                &format!("echo denied > {}", git_target.to_string_lossy()),
+                &format!(
+                    "echo denied > {}",
+                    shell_quote(&git_target.to_string_lossy())
+                ),
             ],
             &[tmpdir.path().to_path_buf()],
             LONG_TIMEOUT_MS,
@@ -485,7 +527,10 @@ async fn sandbox_blocks_git_and_codex_writes_inside_writable_root() {
             &[
                 "bash",
                 "-lc",
-                &format!("echo denied > {}", codex_target.to_string_lossy()),
+                &format!(
+                    "echo denied > {}",
+                    shell_quote(&codex_target.to_string_lossy())
+                ),
             ],
             &[tmpdir.path().to_path_buf()],
             LONG_TIMEOUT_MS,
@@ -501,8 +546,7 @@ async fn sandbox_blocks_git_and_codex_writes_inside_writable_root() {
 
 #[tokio::test]
 async fn sandbox_blocks_codex_symlink_replacement_attack() {
-    if should_skip_bwrap_tests().await {
-        eprintln!("skipping bwrap test: bwrap sandbox prerequisites are unavailable");
+    if skip_if_bwrap_unavailable().await {
         return;
     }
 
@@ -522,7 +566,10 @@ async fn sandbox_blocks_codex_symlink_replacement_attack() {
             &[
                 "bash",
                 "-lc",
-                &format!("echo denied > {}", codex_target.to_string_lossy()),
+                &format!(
+                    "echo denied > {}",
+                    shell_quote(&codex_target.to_string_lossy())
+                ),
             ],
             &[tmpdir.path().to_path_buf()],
             LONG_TIMEOUT_MS,
@@ -537,8 +584,7 @@ async fn sandbox_blocks_codex_symlink_replacement_attack() {
 
 #[tokio::test]
 async fn sandbox_blocks_explicit_split_policy_carveouts_under_bwrap() {
-    if should_skip_bwrap_tests().await {
-        eprintln!("skipping bwrap test: bwrap sandbox prerequisites are unavailable");
+    if skip_if_bwrap_unavailable().await {
         return;
     }
 
@@ -592,7 +638,10 @@ async fn sandbox_blocks_explicit_split_policy_carveouts_under_bwrap() {
             &[
                 "bash",
                 "-lc",
-                &format!("echo denied > {}", blocked_target.to_string_lossy()),
+                &format!(
+                    "echo denied > {}",
+                    shell_quote(&blocked_target.to_string_lossy())
+                ),
             ],
             sandbox_policy,
             file_system_sandbox_policy,
@@ -609,8 +658,7 @@ async fn sandbox_blocks_explicit_split_policy_carveouts_under_bwrap() {
 
 #[tokio::test]
 async fn sandbox_reenables_writable_subpaths_under_unreadable_parents() {
-    if should_skip_bwrap_tests().await {
-        eprintln!("skipping bwrap test: bwrap sandbox prerequisites are unavailable");
+    if skip_if_bwrap_unavailable().await {
         return;
     }
 
@@ -666,15 +714,12 @@ async fn sandbox_reenables_writable_subpaths_under_unreadable_parents() {
             access: FileSystemAccessMode::Write,
         },
     ]);
+    let quoted = shell_quote(&allowed_target.to_string_lossy());
     let output = run_cmd_result_with_policies(
         &[
             "bash",
             "-lc",
-            &format!(
-                "printf allowed > {} && cat {}",
-                allowed_target.to_string_lossy(),
-                allowed_target.to_string_lossy()
-            ),
+            &format!("printf allowed > {quoted} && cat {quoted}"),
         ],
         sandbox_policy,
         file_system_sandbox_policy,
@@ -691,8 +736,7 @@ async fn sandbox_reenables_writable_subpaths_under_unreadable_parents() {
 
 #[tokio::test]
 async fn sandbox_blocks_root_read_carveouts_under_bwrap() {
-    if should_skip_bwrap_tests().await {
-        eprintln!("skipping bwrap test: bwrap sandbox prerequisites are unavailable");
+    if skip_if_bwrap_unavailable().await {
         return;
     }
 
@@ -725,7 +769,7 @@ async fn sandbox_blocks_root_read_carveouts_under_bwrap() {
             &[
                 "bash",
                 "-lc",
-                &format!("cat {}", blocked_target.to_string_lossy()),
+                &format!("cat {}", shell_quote(&blocked_target.to_string_lossy())),
             ],
             sandbox_policy,
             file_system_sandbox_policy,
